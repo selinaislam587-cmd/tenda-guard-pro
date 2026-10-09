@@ -1,0 +1,24 @@
+{
+  "auto_throttle": false,
+  "poll_interval": 10,
+  "server": {
+    "host": "127.0.0.1",
+    "port": 5000
+  },
+  "router": {
+    "ip": "192.168.0.1",
+    "username": "admin",
+    "password": "",
+    "limit_param": "list",
+    "limit_template": "{name}\t{mac}\t{up}\t{down}\t{ip}"
+  },
+  "email": {
+    "sender": "",
+    "app_password": "",
+    "target": ""
+  },
+  "trusted_devices": {},
+  "limits": {},
+  "pending_throttle": [],
+  "notified_macs": []
+}

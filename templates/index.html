@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>Tenda Guard Pro</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script>
+    (function () {
+      try {
+        var saved = localStorage.getItem("tgp-theme");
+        var theme = saved || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+        document.documentElement.setAttribute("data-theme", theme);
+      } catch (e) {}
+    })();
+  </script>
+</head>
+<body>
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+    <defs>
+      <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 4.5-3.2 8.3-8 9-4.8-.7-8-4.5-8-9V6l8-3z"/><path d="M8.5 12l2.5 2.5 4.5-5"/></symbol>
+      <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 10-2.3 5.7"/><path d="M20 5v6h-6"/></symbol>
+      <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 3v9"/><path d="M6.3 6.6a8 8 0 1011.4 0"/></symbol>
+      <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 018 0v3"/></symbol>
+      <symbol id="i-wifi" viewBox="0 0 24 24"><path d="M2 9a15 15 0 0120 0"/><path d="M5 12.5a10 10 0 0114 0"/><path d="M8.5 16a5 5 0 017 0"/><circle cx="12" cy="19.5" r="1"/></symbol>
+      <symbol id="i-gauge" viewBox="0 0 24 24"><path d="M4 18a9 9 0 1116 0"/><path d="M12 14l4-5"/></symbol>
+      <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7h9"/><path d="M17 7h3"/><path d="M4 17h3"/><path d="M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/></symbol>
+      <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6L7 7M17 17l1.4 1.4M5.6 18.4L7 17M17 7l1.4-1.4"/></symbol>
+      <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 019.5 4 8 8 0 1020 14.5z"/></symbol>
+      <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16"/><path d="M9 7V4h6v3"/><path d="M6 7l1 13h10l1-13"/></symbol>
+      <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7"/></symbol>
+      <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.2-4.2"/></symbol>
+      <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12"/><path d="M18 6L6 18"/></symbol>
+      <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+      <symbol id="i-router" viewBox="0 0 24 24"><rect x="3" y="14" width="18" height="6" rx="2"/><path d="M7 17h.01M11 17h.01"/><path d="M8 14l-2-6M16 14l2-6"/></symbol>
+      <symbol id="i-mail" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 7l9 6 9-6"/></symbol>
+      <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 4l9 16H3L12 4z"/><path d="M12 10v4"/><path d="M12 17h.01"/></symbol>
+    </defs>
+  </svg>
+
+  <header class="appbar">
+    <div class="appbar-inner">
+      <div class="brand">
+        <span class="brand-mark"><svg class="i"><use href="#i-shield"/></svg></span>
+        <div class="brand-text">
+          <h1>Tenda Guard Pro</h1>
+          <span id="routerIpLabel" class="brand-sub">Tenda F3</span>
+        </div>
+      </div>
+      <div class="appbar-actions">
+        <button class="icon-btn" id="themeBtn" type="button" aria-label="Switch theme" title="Switch theme">
+          <svg class="i" id="themeIcon"><use href="#i-moon"/></svg>
+        </button>
+        <button class="icon-btn" id="settingsBtn" type="button" aria-label="Open settings" title="Settings">
+          <svg class="i"><use href="#i-sliders"/></svg>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main class="page">
+    <div id="alertBanner" class="banner" hidden>
+      <svg class="i"><use href="#i-alert"/></svg>
+      <span id="alertText"></span>
+    </div>
+
+    <section class="status-grid" aria-label="Network status">
+      <article class="stat">
+        <div class="stat-head"><svg class="i"><use href="#i-wifi"/></svg><span>Connected devices</span></div>
+        <div class="stat-value" id="statConnected">0</div>
+        <div class="stat-foot" id="statTrustedFoot">0 trusted</div>
+      </article>
+      <article class="stat">
+        <div class="stat-head"><svg class="i"><use href="#i-gauge"/></svg><span>Throttled</span></div>
+        <div class="stat-value" id="statThrottled">0</div>
+        <div class="stat-foot" id="statPendingFoot">0 waiting for the router</div>
+      </article>
+      <article class="stat">
+        <div class="stat-head"><svg class="i"><use href="#i-shield"/></svg><span>Auto-throttle</span></div>
+        <div class="stat-row">
+          <label class="switch">
+            <input type="checkbox" id="autoToggle" aria-label="Auto-throttle unknown devices">
+            <span class="track"><span class="thumb"></span></span>
+          </label>
+          <span class="stat-state" id="autoLabel">Off</span>
+        </div>
+        <div class="stat-foot">Limits unknown devices to 1 Kbps</div>
+      </article>
+      <article class="stat">
+        <div class="stat-head"><svg class="i"><use href="#i-router"/></svg><span>Router</span></div>
+        <div class="stat-row"><span class="pill" id="routerPill">Checking</span></div>
+        <div class="stat-foot" id="lastPollFoot">Not updated yet</div>
+      </article>
+    </section>
+
+    <section class="actions" aria-label="Quick actions">
+      <button class="btn btn-danger" id="panicBtn" type="button"><svg class="i"><use href="#i-lock"/></svg><span>Panic lock</span></button>
+      <button class="btn btn-tonal" id="rebootBtn" type="button"><svg class="i"><use href="#i-power"/></svg><span>Reboot router</span></button>
+      <button class="btn btn-tonal" id="refreshBtn" type="button"><svg class="i"><use href="#i-refresh"/></svg><span>Refresh</span></button>
+    </section>
+
+    <nav class="tabs" role="tablist" aria-label="Device lists">
+      <button class="tab is-active" role="tab" id="tabConnected" data-tab="connected" aria-selected="true" type="button">Connected <span class="count" id="countConnected">0</span></button>
+      <button class="tab" role="tab" id="tabTrusted" data-tab="trusted" aria-selected="false" type="button">Trusted <span class="count" id="countTrusted">0</span></button>
+    </nav>
+
+    <section class="panel" id="panelConnected" role="tabpanel" aria-labelledby="tabConnected">
+      <div class="search">
+        <svg class="i"><use href="#i-search"/></svg>
+        <input type="search" id="searchInput" placeholder="Search by name, MAC or IP" autocomplete="off" aria-label="Search devices">
+      </div>
+      <div id="deviceList" class="list"></div>
+    </section>
+
+    <section class="panel" id="panelTrusted" role="tabpanel" aria-labelledby="tabTrusted" hidden>
+      <div id="trustedList" class="list"></div>
+    </section>
+  </main>
+
+  <div id="toastHost" class="toast-host" aria-live="polite"></div>
+
+  <div class="scrim" id="trustModal" hidden>
+    <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="trustTitle">
+      <h2 id="trustTitle">Trust this device</h2>
+      <p class="dialog-sub" id="trustMacLabel"></p>
+      <label class="field">
+        <span>Device name</span>
+        <input type="text" id="trustName" maxlength="60" autocomplete="off">
+      </label>
+      <label class="field">
+        <span>Access duration</span>
+        <select id="trustDuration">
+          <option value="1">1 day</option>
+          <option value="7">7 days</option>
+          <option value="30">30 days</option>
+          <option value="unlimited">Unlimited</option>
+        </select>
+      </label>
+      <div class="dialog-actions">
+        <button class="btn btn-text" type="button" data-close="trustModal">Cancel</button>
+        <button class="btn btn-filled" type="button" id="trustConfirm">Trust device</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="scrim" id="confirmModal" hidden>
+    <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
+      <h2 id="confirmTitle">Are you sure?</h2>
+      <p class="dialog-sub" id="confirmText"></p>
+      <div class="dialog-actions">
+        <button class="btn btn-text" type="button" data-close="confirmModal">Cancel</button>
+        <button class="btn btn-filled" type="button" id="confirmOk">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="scrim" id="settingsModal" hidden>
+    <div class="dialog dialog-wide" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+      <div class="dialog-head">
+        <h2 id="settingsTitle">Settings</h2>
+        <button class="icon-btn" type="button" data-close="settingsModal" aria-label="Close settings"><svg class="i"><use href="#i-close"/></svg></button>
+      </div>
+      <h3 class="group-title"><svg class="i"><use href="#i-mail"/></svg>Email alerts</h3>
+      <label class="field">
+        <span>Sender Gmail address</span>
+        <input type="email" id="setSender" autocomplete="off" placeholder="you@gmail.com">
+      </label>
+      <label class="field">
+        <span>Gmail app password</span>
+        <input type="password" id="setPassword" autocomplete="new-password" placeholder="Leave blank to keep the saved password">
+      </label>
+      <label class="field">
+        <span>Send alerts to</span>
+        <input type="email" id="setTarget" autocomplete="off" placeholder="alerts@example.com">
+      </label>
+      <h3 class="group-title"><svg class="i"><use href="#i-router"/></svg>Router connection</h3>
+      <label class="field">
+        <span>Router address</span>
+        <input type="text" id="setRouterIp" autocomplete="off" placeholder="192.168.0.1">
+      </label>
+      <label class="field">
+        <span>Router admin password (only if your router asks for one)</span>
+        <input type="password" id="setRouterPassword" autocomplete="new-password" placeholder="Leave blank to keep the saved password">
+      </label>
+      <div class="dialog-actions">
+        <button class="btn btn-text" type="button" id="testEmailBtn">Send test email</button>
+        <button class="btn btn-filled" type="button" id="saveSettingsBtn">Save settings</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

@@ -36,5 +36,12 @@ fi
 nohup python app.py >> "$LOG_DIR/app.log" 2>&1 &
 echo $! > "$PID_FILE"
 echo "Tenda Guard Pro started (PID $!). Open http://127.0.0.1:5000"
+
+# Remote access: start the Cloudflare tunnel too when cloudflared is installed.
+# Set TGP_TUNNEL=0 to skip it.
+if [ "${TGP_TUNNEL:-1}" != "0" ] && command -v cloudflared >/dev/null 2>&1 && [ -x "$APP_DIR/start_tunnel.sh" ]; then
+  nohup "$APP_DIR/start_tunnel.sh" >> "$LOG_DIR/tunnel-supervisor.log" 2>&1 &
+  echo "Remote tunnel starting. The link will be emailed to you (see logs/tunnel.log)."
+fi
 echo "First run only: the generated web password is printed in $LOG_DIR/app.log"
 echo "Optional: set TGP_WEB_PASSWORD before running to choose your own."

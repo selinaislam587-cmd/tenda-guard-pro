@@ -22,12 +22,13 @@ import os
 import re
 import secrets
 import smtplib
+import socket
 import ssl
 import threading
 import time
 from datetime import datetime, timedelta
 from email.message import EmailMessage
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 import requests
 from flask import (Flask, Response, jsonify, redirect, render_template, request,
@@ -334,15 +335,61 @@ class RouterClient:
         return os.environ.get("TGP_ROUTER_PASSWORD") or cfg["router"].get("password", "")
 
     def raw(self, method, path, **kwargs):
-        headers = kwargs.get("headers", {})
-        if "Referer" not in headers:
-            headers["Referer"] = self.base_url() + "/index.html"
-        if "Origin" not in headers:
-            headers["Origin"] = self.base_url()
-        kwargs["headers"] = headers
         return self.session.request(
             method, self.base_url() + path, timeout=(4, 8), allow_redirects=False, **kwargs
         )
+
+    # ---- tolerant raw HTTP (this router can send malformed headers) ----
+    def raw_http(self, method, path, form=None, cookie=None):
+        """Plain-socket request that keeps every header line, even malformed ones.
+        The requests library can silently drop Set-Cookie when the router sends a
+        broken header line before it."""
+        host, _, port = self.host().partition(":")
+        body = urlencode(form).encode("utf-8") if form is not None else b""
+        lines = ["{} {} HTTP/1.1".format(method, path), "Host: {}".format(self.host()),
+                 "User-Agent: Mozilla/5.0 (TendaGuardPro)", "Accept: */*", "Connection: close"]
+        if form is not None:
+            lines += ["Content-Type: application/x-www-form-urlencoded", "Content-Length: {}".format(len(body))]
+        if cookie:
+            lines.append("Cookie: " + cookie)
+        request_bytes = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8") + body
+        chunks = []
+        total = 0
+        with socket.create_connection((host, int(port) if port else 80), timeout=6) as sock:
+            sock.settimeout(6)
+            sock.sendall(request_bytes)
+            try:
+                while total < 300000:
+                    data = sock.recv(8192)
+                    if not data:
+                        break
+                    chunks.append(data)
+                    total += len(data)
+            except socket.timeout:
+                pass
+        blob = b"".join(chunks)
+        head, sep, rest = blob.partition(b"\r\n\r\n")
+        if not sep:
+            head, sep, rest = blob.partition(b"\n\n")
+        head_lines = head.decode("latin-1").splitlines()
+        status = 0
+        if head_lines:
+            match = re.match(r"HTTP/\S+\s+(\d{3})", head_lines[0])
+            status = int(match.group(1)) if match else 0
+        return {"status": status, "headers": head_lines[1:], "body": rest.decode("utf-8", "replace")}
+
+    def absorb_cookies(self, header_lines, domain):
+        """Copies every Set-Cookie into the session. Returns names with value lengths only."""
+        names = []
+        for line in header_lines:
+            if line.lower().startswith("set-cookie:"):
+                pair = line.split(":", 1)[1].strip().split(";")[0]
+                name, _, value = pair.partition("=")
+                name, value = name.strip(), value.strip()
+                if name:
+                    self.session.cookies.set(name, value, domain=domain, path="/")
+                    names.append("{}({} chars)".format(name, len(value)))
+        return names
 
     # ---- device list ----
     def endpoint_specs(self):
@@ -416,7 +463,8 @@ class RouterClient:
     def discover_login(self):
         """Reads the router's own login page to learn field names, form targets and hints."""
         info = {"page_status": None, "actions": [], "user_field": "", "pass_field": "", "hidden": {},
-                "js_urls": [], "hints": [], "kinds": list(PASSWORD_KINDS), "scripts_read": 0}
+                "js_urls": [], "hints": [], "kinds": list(PASSWORD_KINDS), "scripts_read": 0,
+                "form_html": "", "js_windows": []}
         try:
             page = self.raw("GET", "/login.html")
         except requests.RequestException:
@@ -442,8 +490,11 @@ class RouterClient:
                 info["user_field"] = name.group(1)
             elif kind == "hidden":
                 info["hidden"][name.group(1)] = value.group(1) if value else ""
+        form_match = re.search(r"<form[^>]*>.*?</form>", html, re.I | re.S)
+        info["form_html"] = " ".join(form_match.group(0).split())[:600] if form_match else ""
+        scripts_blob = "\n".join(re.findall(r"<script(?![^>]*\bsrc\b)[^>]*>(.*?)</script>", html, re.I | re.S))
         blob = html
-        for src_url in re.findall(r"<script[^>]+src\s*=\s*[\"']([^\"']+)", html, re.I)[:5]:
+        for src_url in re.findall(r"<script[^>]+src\s*=\s*[\"']([^\"']+)", html, re.I)[:14]:
             if src_url.startswith("http"):
                 continue
             path = src_url if src_url.startswith("/") else "/" + src_url
@@ -453,6 +504,7 @@ class RouterClient:
                 continue
             if script.status_code == 200:
                 blob += "\n" + script.text[:300000]
+                scripts_blob += "\n" + script.text[:300000]
                 info["scripts_read"] += 1
         for url in re.findall(r"[\"'](/[A-Za-z0-9_./\-]*(?:login|Login|auth|Auth)[A-Za-z0-9_./\-]*)[\"']", blob):
             if url not in info["js_urls"] and not url.endswith((".html", ".js", ".css")):
@@ -462,6 +514,15 @@ class RouterClient:
                 cleaned = " ".join(line.split())[:180]
                 if cleaned and cleaned not in info["hints"]:
                     info["hints"].append(cleaned)
+        windows = []
+        last_end = -1
+        for match in re.finditer(r"ecos_pw|\.cookie|hex_md5|md5\(|[Bb]ase64|btoa|/login/Auth|getElementById\([\"']password", scripts_blob):
+            if match.start() < last_end or len(windows) >= 12:
+                continue
+            start, end = max(0, match.start() - 90), match.end() + 150
+            windows.append(" ".join(scripts_blob[start:end].split())[:240])
+            last_end = end
+        info["js_windows"] = windows
         has_b64 = bool(re.search(r"base64|btoa", blob, re.I))
         has_md5 = bool(re.search(r"md5", blob, re.I))
         if has_md5 and not has_b64:
@@ -475,17 +536,19 @@ class RouterClient:
             if path and path not in paths:
                 paths.append(path)
         paths = paths[:3]
-        fieldsets = []
-        if disc["user_field"] or disc["pass_field"]:
-            fieldsets.append((disc["user_field"] or "username", disc["pass_field"] or "password"))
+        pass_name = disc["pass_field"] or "password"
+        fieldsets = [(None, pass_name)]
+        if disc["user_field"]:
+            fieldsets.append((disc["user_field"], pass_name))
         for pair in [("username", "password"), ("user", "pass")]:
             if pair not in fieldsets:
                 fieldsets.append(pair)
-        fieldsets = fieldsets[:2]
+        fieldsets = fieldsets[:3]
 
         def post_data(user_key, pass_key, kind):
             data = dict(disc["hidden"])
-            data[user_key] = user
+            if user_key:
+                data[user_key] = user
             data[pass_key] = encode_password(kind, password)
             return data
 
@@ -493,7 +556,7 @@ class RouterClient:
         first_user, first_pass = fieldsets[0]
         candidates = []
         for kind in kinds:
-            candidates.append({"label": "POST {} {}/{} password={}".format(first_path, first_user, first_pass, kind),
+            candidates.append({"label": "POST {} {}/{} password={}".format(first_path, first_user or "(no username)", first_pass, kind),
                                "cookie": None, "post": (first_path, post_data(first_user, first_pass, kind)), "inline": None})
         for kind in kinds:
             candidates.append({"label": "cookie {}={} + POST {}".format(AUTH_COOKIE, kind, first_path),
@@ -508,12 +571,12 @@ class RouterClient:
         for path in paths:
             for user_key, pass_key in fieldsets:
                 for kind in kinds:
-                    label = "POST {} {}/{} password={}".format(path, user_key, pass_key, kind)
+                    label = "POST {} {}/{} password={}".format(path, user_key or "(no username)", pass_key, kind)
                     if any(c["label"] == label for c in candidates):
                         continue
                     candidates.append({"label": label, "cookie": None,
                                        "post": (path, post_data(user_key, pass_key, kind)), "inline": None})
-        return candidates[:30]
+        return candidates[:36]
 
     def login(self):
         if time.time() < self.backoff_until:
@@ -529,6 +592,7 @@ class RouterClient:
             candidates = [self.winner] + [c for c in candidates if c["label"] != self.winner["label"]]
 
         attempts = []
+        raw_replies = []
         errors = 0
         for candidate in candidates:
             self.session.cookies.clear()
@@ -539,23 +603,32 @@ class RouterClient:
             valid = False
             try:
                 if candidate["post"]:
-                    reply = self.raw("POST", candidate["post"][0], data=candidate["post"][1])
-                    outcome = "POST {}".format(reply.status_code)
+                    cookie_header = "{}={}".format(*candidate["cookie"]) if candidate["cookie"] else None
+                    reply = self.raw_http("POST", candidate["post"][0], form=candidate["post"][1], cookie=cookie_header)
+                    added = self.absorb_cookies(reply["headers"], domain)
+                    outcome = "POST {} cookies set: {}".format(reply["status"], ", ".join(added) or "none")
+                    if len(raw_replies) < 3:
+                        location = next((h.split(":", 1)[1].strip() for h in reply["headers"] if h.lower().startswith("location:")), "")
+                        raw_replies.append({
+                            "label": candidate["label"], "status": reply["status"], "location": location,
+                            "header_names": [h.split(":", 1)[0] if ":" in h else "(malformed line)" for h in reply["headers"]],
+                            "body": " ".join(reply["body"][:120].split()),
+                        })
                 valid = self.session_valid()
                 outcome += (" , " if outcome else "") + ("list OK" if valid else "still login page")
-            except requests.RequestException as exc:
+            except (requests.RequestException, OSError) as exc:
                 errors += 1
                 outcome = "network error {}".format(exc.__class__.__name__)
             attempts.append({"label": candidate["label"], "result": outcome})
             if valid:
                 self.winner = candidate
                 self.fail_count = 0
-                self.last_login = {"discovery": discovery, "attempts": attempts, "ok": True}
+                self.last_login = {"discovery": discovery, "attempts": attempts, "ok": True, "raw": raw_replies}
                 return True
             self.inline_pw = None
 
         self.session.cookies.clear()
-        self.last_login = {"discovery": discovery, "attempts": attempts, "ok": False}
+        self.last_login = {"discovery": discovery, "attempts": attempts, "ok": False, "raw": raw_replies}
         if attempts and errors == len(attempts):
             raise requests.ConnectionError("every login attempt failed to connect")
         self.fail_count += 1
@@ -623,6 +696,7 @@ class RouterClient:
         """Human readable report of what the router does. Never includes passwords or cookie values."""
         lines = []
         with self.lock:
+            self.backoff_until = 0
             lines.append("Router: {}".format(self.host()))
             lines.append("Admin password saved: {}".format("yes" if self.password() else "NO"))
             try:
@@ -646,12 +720,21 @@ class RouterClient:
                 lines.append("Router login page: HTTP {} , form actions {} , user field {} , password field {} , scripts read {}".format(
                     disc.get("page_status"), disc.get("actions") or "none", disc.get("user_field") or "?",
                     disc.get("pass_field") or "?", disc.get("scripts_read")))
-                for hint in disc.get("hints", [])[:8]:
-                    lines.append("  login script: {}".format(hint))
-                for item in report.get("attempts", [])[:14]:
+                if disc.get("form_html"):
+                    lines.append("Login form: {}".format(disc["form_html"]))
+                for window in disc.get("js_windows", []):
+                    lines.append("  js: {}".format(window))
+                for reply in report.get("raw", []):
+                    lines.append("Raw login reply ({}): HTTP {} , Location {} , headers {} , body: {}".format(
+                        reply["label"], reply["status"], reply["location"] or "-", ", ".join(reply["header_names"]) or "none",
+                        reply["body"] or "(empty)"))
+                for item in report.get("attempts", [])[:16]:
                     lines.append("  tried: {} -> {}".format(item["label"], item["result"]))
+                if not report.get("ok"):
+                    lines.append("If every try returns 302 with no cookie set, the router is probably rejecting the password "
+                                 "itself: sign in at http://{} in a browser with the exact password saved here.".format(self.host()))
             names = sorted({cookie.name for cookie in self.session.cookies})
-            lines.append("Cookies held: {}".format(", ".join(names) or "none"))
+            lines.append("Cookies held after the test: {}".format(", ".join(names) or "none"))
             try:
                 devices = self.get_devices()
                 lines.append("Devices found now: {}".format(len(devices)))
@@ -963,8 +1046,6 @@ def origin_ok():
 
 @app.before_request
 def guard():
-    session["auth"] = True
-    return None
     if request.endpoint in PUBLIC_ENDPOINTS:
         if request.method == "POST" and not origin_ok():
             return fail("Cross-site request blocked.", 403)

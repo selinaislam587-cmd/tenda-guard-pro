@@ -58,8 +58,8 @@ DEFAULT_CONFIG = {
         "ip": "192.168.0.1",
         "username": "admin",
         "password": "",
-        "devices_endpoint": "/goform/getOnlineList",
-        "fallback_endpoints": ["/goform/getNetDeviceList"],
+        "devices_endpoint": "/goform/getOnlineDeviceList",
+        "fallback_endpoints": ["/goform/GetOnlineDevice", "/goform/getNetDeviceList"],
         "limit_param": "list",
         "limit_template": "{name}\t{mac}\t{up}\t{down}\t{ip}",
     },
@@ -306,14 +306,29 @@ class RouterClient:
         return items
 
     def fetch_devices(self):
+        items = self.endpoints()
         last = None
-        for path in self.endpoints():
-            resp = self.raw("GET", path, params={"random": "%.6f" % time.time()})
-            if resp.status_code == 404:
+        for path in items:
+            # ১. প্রথমে GET রিকোয়েস্ট ট্রাই করি
+            try:
+                resp = self.raw("GET", path, params={"random": "%.6f" % time.time()})
+                if resp.status_code == 200 and not looks_like_login(resp):
+                    return path, resp
                 last = resp
-                continue
-            return path, resp
+            except Exception:
+                pass
+
+            # ২. GET কাজ না করলে POST রিকোয়েস্ট ট্রাই করি
+            try:
+                resp = self.raw("POST", path, data={})
+                if resp.status_code == 200 and not looks_like_login(resp):
+                    return path, resp
+                last = resp
+            except Exception:
+                pass
+
         return None, last
+
 
     def session_valid(self):
         path, resp = self.fetch_devices()

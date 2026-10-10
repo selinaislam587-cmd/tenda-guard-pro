@@ -240,14 +240,27 @@ class RouterAuthError(Exception):
     """The router wants a login and we could not provide a working one."""
 
 
+class RouterFormatError(Exception):
+    """The router answered, but not with a device list we can read."""
+
+
+MOVED_HINTS = ("moved to a new location", "this document has moved", "object moved")
+
+
 def looks_like_login(resp):
     if resp is None:
         return False
     if resp.status_code in (401, 403):
         return True
-    if resp.status_code in (301, 302, 303, 307, 308):
-        return "login" in resp.headers.get("Location", "").lower()
+    location = resp.headers.get("Location", "").lower()
     head = (resp.text or "")[:1500].lower()
+    if 300 <= resp.status_code < 400:
+        return "login" in location or "login" in head or not location
+    if any(hint in head for hint in MOVED_HINTS):
+        return True
+    stripped = head.lstrip()
+    if stripped and stripped[0] not in "[{" and "login.html" in head:
+        return True
     if "<html" in head or "<!doctype" in head:
         return "login" in head or 'type="password"' in head or "type='password'" in head
     return False
@@ -262,8 +275,9 @@ class RouterClient:
         with self.lock:
             self.session = requests.Session()
             self.session.headers.update({"User-Agent": "Mozilla/5.0 (TendaGuardPro)", "Accept": "*/*"})
-            self.strategy = None
+            self.winner = None
             self.endpoint = None
+            self.last_login = {}
             self.fail_count = 0
             self.backoff_until = 0
 
@@ -305,6 +319,91 @@ class RouterClient:
         path, resp = self.fetch_devices()
         return resp is not None and resp.status_code == 200 and not looks_like_login(resp)
 
+    def discover_login(self):
+        """Reads the router's own login page to learn the form, field names and script URLs."""
+        info = {"page_status": None, "actions": [], "user_field": "", "pass_field": "",
+                "hidden": {}, "js_urls": [], "uses_md5": True, "scripts_read": 0}
+        try:
+            page = self.raw("GET", "/login.html")
+        except requests.RequestException:
+            return info
+        info["page_status"] = page.status_code
+        html = page.text or ""
+        if page.status_code != 200 or not html:
+            return info
+        forms = re.findall(r"<form[^>]*>", html, re.I)
+        for tag in forms:
+            match = re.search(r"action\s*=\s*[\"']([^\"']*)", tag, re.I)
+            if match and match.group(1) and not match.group(1).startswith("#"):
+                info["actions"].append(match.group(1) if match.group(1).startswith("/") else "/" + match.group(1))
+        for tag in re.findall(r"<input[^>]*>", html, re.I):
+            name = re.search(r"name\s*=\s*[\"']([^\"']+)", tag, re.I)
+            kind = re.search(r"type\s*=\s*[\"']([^\"']+)", tag, re.I)
+            value = re.search(r"value\s*=\s*[\"']([^\"']*)", tag, re.I)
+            if not name:
+                continue
+            kind = kind.group(1).lower() if kind else "text"
+            if kind == "password" and not info["pass_field"]:
+                info["pass_field"] = name.group(1)
+            elif kind == "text" and not info["user_field"]:
+                info["user_field"] = name.group(1)
+            elif kind == "hidden":
+                info["hidden"][name.group(1)] = value.group(1) if value else ""
+        blob = html
+        for src_url in re.findall(r"<script[^>]+src\s*=\s*[\"']([^\"']+)", html, re.I)[:4]:
+            if src_url.startswith("http"):
+                continue
+            path = src_url if src_url.startswith("/") else "/" + src_url
+            try:
+                script = self.raw("GET", path)
+            except requests.RequestException:
+                continue
+            if script.status_code == 200:
+                blob += "\n" + script.text[:200000]
+                info["scripts_read"] += 1
+        for url in re.findall(r"[\"'](/[A-Za-z0-9_./\-]*(?:login|Login|auth|Auth)[A-Za-z0-9_./\-]*)[\"']", blob):
+            if url not in info["js_urls"] and not url.endswith((".html", ".js", ".css")):
+                info["js_urls"].append(url)
+        info["uses_md5"] = bool(re.search(r"md5", blob, re.I)) or not blob.strip()
+        return info
+
+    def login_candidates(self, user, password, digest, disc):
+        kinds = [("md5", digest), ("plain", password)] if disc["uses_md5"] else [("plain", password), ("md5", digest)]
+        paths = []
+        for path in disc["actions"] + disc["js_urls"] + ["/login/Auth", "/login.cgi", "/goform/login"]:
+            if path and path not in paths:
+                paths.append(path)
+        paths = paths[:5]
+        fieldsets = []
+        if disc["user_field"] or disc["pass_field"]:
+            fieldsets.append((disc["user_field"] or "username", disc["pass_field"] or "password"))
+        for pair in [("username", "password"), ("user", "pass"), ("user", "password"), ("login_user", "login_pwd")]:
+            if pair not in fieldsets:
+                fieldsets.append(pair)
+        fieldsets = fieldsets[:3]
+
+        def data_for(user_key, pass_key, value):
+            data = dict(disc["hidden"])
+            data[user_key] = user
+            data[pass_key] = value
+            return data
+
+        candidates = [{"label": "session cookie only (md5)", "cookie": True, "path": None, "data": {}}]
+        for index, path in enumerate(paths):
+            for user_key, pass_key in fieldsets:
+                for kind, value in kinds:
+                    candidates.append({
+                        "label": "POST {} fields {}/{} value {}".format(path, user_key, pass_key, kind),
+                        "cookie": False, "path": path, "data": data_for(user_key, pass_key, value),
+                    })
+            if index == 0:
+                user_key, pass_key = fieldsets[0]
+                candidates.append({
+                    "label": "cookie + POST {} fields {}/{} value md5".format(path, user_key, pass_key),
+                    "cookie": True, "path": path, "data": data_for(user_key, pass_key, digest),
+                })
+        return candidates[:32]
+
     def login(self):
         if time.time() < self.backoff_until:
             raise RouterAuthError("Waiting a moment before the next router login attempt.")
@@ -313,31 +412,85 @@ class RouterClient:
             raise RouterAuthError("The router asked for a login but no admin password is saved. Add it in Settings.")
         user = cfg["router"].get("username", "admin")
         digest = hashlib.md5(password.encode("utf-8")).hexdigest()
-        order = ["md5-post", "md5-cookie", "plain-post"]
-        if self.strategy in order:
-            order.remove(self.strategy)
-            order.insert(0, self.strategy)
         domain = self.host().split(":")[0]
+        discovery = self.discover_login()
+        candidates = self.login_candidates(user, password, digest, discovery)
+        if self.winner:
+            candidates = [self.winner] + [c for c in candidates if c["label"] != self.winner["label"]]
 
-        for name in order:
+        attempts = []
+        errors = 0
+        for candidate in candidates:
             self.session.cookies.clear()
-            if name == "md5-post":
-                self.raw("POST", "/login/Auth", data={"username": user, "password": digest})
-            elif name == "md5-cookie":
+            if candidate["cookie"]:
                 self.session.cookies.set("password", digest, domain=domain, path="/")
-                self.raw("POST", "/login/Auth", data={"username": user, "password": digest})
-            else:
-                self.raw("POST", "/login/Auth", data={"username": user, "password": password})
-            if self.session_valid():
-                self.strategy = name
+            outcome = ""
+            try:
+                if candidate["path"]:
+                    reply = self.raw("POST", candidate["path"], data=candidate["data"])
+                    outcome = "POST {}".format(reply.status_code)
+                valid = self.session_valid()
+                outcome += (" , " if outcome else "") + ("list OK" if valid else "still login page")
+            except requests.RequestException as exc:
+                errors += 1
+                valid = False
+                outcome = "network error {}".format(exc.__class__.__name__)
+            attempts.append({"label": candidate["label"], "result": outcome})
+            if valid:
+                self.winner = candidate
                 self.fail_count = 0
+                self.last_login = {"discovery": discovery, "attempts": attempts, "ok": True}
                 return True
 
         self.session.cookies.clear()
+        self.last_login = {"discovery": discovery, "attempts": attempts, "ok": False}
+        if errors == len(attempts):
+            raise requests.ConnectionError("every login attempt failed to connect")
         self.fail_count += 1
         if self.fail_count >= 3:
             self.backoff_until = time.time() + min(600, 60 * self.fail_count)
-        raise RouterAuthError("Router login failed. Check the admin password in Settings.")
+        raise RouterAuthError("Router login failed. Use Settings > Test router connection to see why.")
+
+    def diagnose(self):
+        """Human readable report of what the router does. Never includes passwords."""
+        lines = []
+        with self.lock:
+            lines.append("Router: {}".format(self.host()))
+            lines.append("Admin password saved: {}".format("yes" if self.password() else "NO"))
+            try:
+                path, resp = self.fetch_devices()
+            except requests.RequestException as exc:
+                return ["Router: {}".format(self.host()), "Cannot connect: {}".format(exc.__class__.__name__),
+                        "Check the router address and that this phone is on the router's Wi-Fi."]
+            snippet = " ".join((resp.text or "")[:160].split()) if resp is not None else ""
+            lines.append("Device list request: {} -> HTTP {}".format(path, resp.status_code if resp is not None else "none"))
+            if resp is not None and resp.headers.get("Location"):
+                lines.append("Redirect to: {}".format(resp.headers["Location"]))
+            lines.append("Reply starts with: {}".format(snippet or "(empty)"))
+            needs_login = looks_like_login(resp)
+            lines.append("Detected as login page: {}".format("yes" if needs_login else "no"))
+            if needs_login:
+                try:
+                    self.login()
+                except (RouterAuthError, requests.RequestException) as exc:
+                    lines.append("Login result: FAILED ({})".format(str(exc)[:120]))
+                else:
+                    lines.append("Login result: OK using: {}".format(self.winner["label"]))
+                report = self.last_login
+                disc = report.get("discovery", {})
+                lines.append("Router login page: HTTP {} , form actions {} , user field {} , password field {} , scripts read {} , uses md5 {}".format(
+                    disc.get("page_status"), disc.get("actions") or "none", disc.get("user_field") or "?",
+                    disc.get("pass_field") or "?", disc.get("scripts_read"), disc.get("uses_md5")))
+                if disc.get("js_urls"):
+                    lines.append("Login URLs seen in its scripts: {}".format(", ".join(disc["js_urls"][:6])))
+                for item in report.get("attempts", [])[:12]:
+                    lines.append("  tried: {} -> {}".format(item["label"], item["result"]))
+            try:
+                devices = self.get_devices()
+                lines.append("Devices found now: {}".format(len(devices)))
+            except (RouterAuthError, RouterFormatError, requests.RequestException) as exc:
+                lines.append("Device list still failing: {}".format(str(exc)[:140]))
+        return lines
 
     def get_devices(self):
         with self.lock:
@@ -349,7 +502,14 @@ class RouterClient:
                     raise RouterAuthError("The router still shows its login page after signing in.")
             resp.raise_for_status()
             self.endpoint = path
-            return parse_devices(resp.text)
+            devices = parse_devices(resp.text)
+            body_text = (resp.text or "").strip()
+            if not devices and body_text and body_text not in ("[]", "{}") and not MAC_RE.search(body_text):
+                try:
+                    json.loads(body_text)
+                except ValueError:
+                    raise RouterFormatError("Unexpected reply from the router: {}".format(" ".join(body_text[:80].split())))
+            return devices
 
     def call(self, method, path, **kwargs):
         with self.lock:
@@ -559,6 +719,10 @@ def poll_once():
         devices = router.get_devices()
     except RouterAuthError as exc:
         mark_failure(str(exc), auth=True)
+        bus.publish()
+        return
+    except RouterFormatError as exc:
+        mark_failure(str(exc))
         bus.publish()
         return
     except requests.RequestException as exc:
@@ -1095,6 +1259,15 @@ def api_change_password():
     session["auth"] = True
     session["csrf"] = secrets.token_urlsafe(24)
     return jsonify({"ok": True, "csrf": session["csrf"]})
+
+
+@app.route("/api/diagnose", methods=["POST"])
+def api_diagnose():
+    try:
+        lines = router.diagnose()
+    except Exception as exc:  # report instead of crashing the request
+        lines = ["Diagnosis failed: {}".format(str(exc)[:160])]
+    return jsonify({"ok": True, "lines": lines})
 
 
 @app.route("/api/test-email", methods=["POST"])

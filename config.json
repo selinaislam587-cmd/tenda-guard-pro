@@ -19,10 +19,7 @@
     "username": "admin",
     "password": "226435",
     "devices_endpoint": "/goform/getQos",
-    "fallback_endpoints": [
-      "/goform/getOnlineList",
-      "/goform/getNetDeviceList"
-    ],
+    "fallback_endpoints": ["/goform/getOnlineList", "/goform/getNetDeviceList"],
     "limit_endpoint": "/goform/setQos",
     "limit_param": "list",
     "limit_template": "{name}\t{mac}\t{up}\t{down}\t{ip}"

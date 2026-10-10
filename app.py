@@ -1053,6 +1053,11 @@ def fail(message, status=400):
 
 
 def origin_ok():
+    """Blocks cross-site form posts. Browsers send Sec-Fetch-Site themselves and page
+    scripts cannot forge it, so it is the primary signal. Without it, fall back to Origin."""
+    site = request.headers.get("Sec-Fetch-Site")
+    if site:
+        return site in ("same-origin", "none")
     origin = request.headers.get("Origin")
     if not origin:
         return True
@@ -1083,7 +1088,7 @@ def guard():
 @app.after_request
 def secure_headers(response):
     response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Referrer-Policy"] = "same-origin"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "

@@ -334,6 +334,12 @@ class RouterClient:
         return os.environ.get("TGP_ROUTER_PASSWORD") or cfg["router"].get("password", "")
 
     def raw(self, method, path, **kwargs):
+        headers = kwargs.get("headers", {})
+        if "Referer" not in headers:
+            headers["Referer"] = self.base_url() + "/index.html"
+        if "Origin" not in headers:
+            headers["Origin"] = self.base_url()
+        kwargs["headers"] = headers
         return self.session.request(
             method, self.base_url() + path, timeout=(4, 8), allow_redirects=False, **kwargs
         )

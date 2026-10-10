@@ -1,13 +1,25 @@
 /* =============================================================================
-   Tenda Guard Pro - static/app.js
-   Vanilla JS frontend. All dynamic text is inserted with textContent, so device
-   names coming from the network can never inject markup.
+   Tenda Guard Pro - static/app.js  (v2)
+   - Live updates through Server-Sent Events (EventSource) with automatic
+     reconnect, a stall watchdog and a polling fallback.
+   - Persistence: the last snapshot and your UI choices are kept in
+     localStorage, so a reload paints instantly and never shows an empty list
+     while the first update is on its way.
+   - A snapshot with zero devices never replaces a non-empty list while the
+     router is unreachable.
+   All dynamic text is inserted with textContent, so device names coming from
+   the network cannot inject markup.
    ============================================================================= */
 (function () {
   "use strict";
 
-  var POLL_MS = 5000;
   var SVG_NS = "http://www.w3.org/2000/svg";
+  var CACHE_KEY = "tgp-cache";
+  var UI_KEY = "tgp-ui";
+  var STALL_MS = 16000;
+
+  var csrfMeta = document.querySelector('meta[name="csrf-token"]');
+  var csrfToken = csrfMeta ? csrfMeta.getAttribute("content") : "";
 
   var state = {
     data: null,
@@ -19,6 +31,8 @@
     confirmAction: null
   };
 
+  var stream = { source: null, lastMessage: 0, fallbackTimer: null, reconnectTimer: null };
+
   var PRESETS = [
     { label: "1K", preset: "1k", kbps: 1 },
     { label: "512K", preset: "512k", kbps: 512 },
@@ -27,6 +41,22 @@
   ];
 
   function $(id) { return document.getElementById(id); }
+
+  /* ---------- Storage (never throws) ---------- */
+  function readStore(key) {
+    try {
+      var raw = localStorage.getItem(key);
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) { return null; }
+  }
+
+  function writeStore(key, value) {
+    try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { /* storage full or blocked */ }
+  }
+
+  function saveUi() {
+    writeStore(UI_KEY, { tab: state.tab, search: state.search, durations: state.durations });
+  }
 
   /* ---------- DOM helpers ---------- */
   function icon(name) {
@@ -86,22 +116,35 @@
   }
 
   /* ---------- API ---------- */
+  function goToLogin() { window.location.href = "/login"; }
+
   function api(path, method, payload) {
-    var options = { method: method || "GET", headers: {} };
-    if (payload !== undefined) {
-      options.headers["Content-Type"] = "application/json";
-      options.body = JSON.stringify(payload);
-    } else if (options.method !== "GET") {
-      options.headers["Content-Type"] = "application/json";
-      options.body = "{}";
+    var verb = method || "GET";
+    var headers = {};
+    var options = { method: verb, headers: headers, credentials: "same-origin" };
+    if (verb !== "GET") {
+      headers["Content-Type"] = "application/json";
+      headers["X-CSRF-Token"] = csrfToken;
+      options.body = JSON.stringify(payload === undefined ? {} : payload);
+    }
+    var controller = window.AbortController ? new AbortController() : null;
+    var timer = null;
+    if (controller) {
+      options.signal = controller.signal;
+      timer = setTimeout(function () { controller.abort(); }, 15000);
     }
     return fetch(path, options).then(function (response) {
+      if (timer) { clearTimeout(timer); }
+      if (response.status === 401) { goToLogin(); throw new Error("Signed out. Redirecting to sign in."); }
       return response.json().catch(function () { return {}; }).then(function (json) {
         if (!response.ok || json.ok === false) {
           throw new Error(json.error || "Request failed (" + response.status + ")");
         }
         return json;
       });
+    }, function (error) {
+      if (timer) { clearTimeout(timer); }
+      throw new Error(error && error.name === "AbortError" ? "The request timed out." : "Network error. Check your connection.");
     });
   }
 
@@ -145,6 +188,24 @@
     return JSON.stringify([devices, trusted, state.search, state.tab]);
   }
 
+  function setLive(kind) {
+    var labels = { live: "Live", retry: "Reconnecting", cached: "Saved data", connecting: "Connecting" };
+    $("liveBadge").setAttribute("data-state", kind);
+    $("liveText").textContent = labels[kind] || "Connecting";
+  }
+
+  function bannerMessage(data) {
+    if (data.auth_error) {
+      return (data.last_error || "The router login failed.") + (data.devices.length ? " Showing the last known devices." : "");
+    }
+    if (!data.router_online) {
+      return "The router at " + data.router_ip + " is not responding." + (data.devices.length ? " Showing the last known devices." : " Check that this phone is on the router's network.");
+    }
+    if (data.last_error) { return data.last_error; }
+    if (data.mail_error) { return "Email alerts are failing: " + data.mail_error; }
+    return "";
+  }
+
   function renderStatus(data) {
     $("routerIpLabel").textContent = "Tenda F3 at " + data.router_ip;
     $("statConnected").textContent = data.metrics.connected;
@@ -153,21 +214,24 @@
     $("statPendingFoot").textContent = data.metrics.pending + " waiting for the router";
     $("autoToggle").checked = data.auto_throttle;
     $("autoLabel").textContent = data.auto_throttle ? "On" : "Off";
+
     var pill = $("routerPill");
-    pill.textContent = data.router_online ? "Online" : "Unreachable";
-    pill.className = "pill " + (data.router_online ? "ok" : "bad");
+    if (data.auth_error) {
+      pill.textContent = "Login failed";
+      pill.className = "pill bad";
+    } else if (!data.router_online) {
+      pill.textContent = "Unreachable";
+      pill.className = "pill bad";
+    } else {
+      pill.textContent = "Online";
+      pill.className = "pill ok";
+    }
     $("lastPollFoot").textContent = clock(data.last_poll);
     $("countConnected").textContent = data.metrics.connected;
     $("countTrusted").textContent = data.metrics.trusted;
 
-    var banner = $("alertBanner");
-    var message = "";
-    if (!data.router_online) {
-      message = "The router at " + data.router_ip + " is not responding. Check that this device is on the router's network.";
-    } else if (data.mail_error) {
-      message = "Email alerts are failing: " + data.mail_error;
-    }
-    banner.hidden = !message;
+    var message = bannerMessage(data);
+    $("alertBanner").hidden = !message;
     $("alertText").textContent = message;
   }
 
@@ -188,9 +252,7 @@
     meta.appendChild(badge(device.ip || "No IP", ""));
     info.appendChild(meta);
     top.appendChild(info);
-
-    var speedBadge = badge(speedLabel(device.limit_kbps), device.throttled ? "limited" : "free", "gauge");
-    top.appendChild(speedBadge);
+    top.appendChild(badge(speedLabel(device.limit_kbps), device.throttled ? "limited" : "free", "gauge"));
     card.appendChild(top);
 
     var chips = el("div", "chips");
@@ -200,7 +262,7 @@
       var selected = device.limit_kbps === item.kbps || (item.kbps === 0 && (device.limit_kbps === null || device.limit_kbps === undefined));
       var chip = button(item.label, "chip" + (selected ? " is-selected" : ""), function () {
         api("/api/set-speed", "POST", { mac: device.mac, preset: item.preset })
-          .then(function () { toast(device.name + " set to " + speedLabel(item.kbps)); return load(); })
+          .then(function () { toast(device.name + " set to " + speedLabel(item.kbps)); return refreshNow(); })
           .catch(fail);
       });
       chip.setAttribute("aria-pressed", selected ? "true" : "false");
@@ -215,6 +277,7 @@
       var untilText = el("span");
       if (device.expires_at) {
         untilText.setAttribute("data-expires", device.expires_at);
+        untilText.setAttribute("data-prefix", "Trusted, ");
         untilText.textContent = "Trusted, " + timeLeft(device.expires_at - Date.now() / 1000);
       } else {
         untilText.textContent = "Trusted, no expiry";
@@ -231,7 +294,7 @@
         select.appendChild(option);
       });
       select.value = state.durations[device.mac] || "7";
-      select.addEventListener("change", function () { state.durations[device.mac] = select.value; });
+      select.addEventListener("change", function () { state.durations[device.mac] = select.value; saveUi(); });
       row.appendChild(select);
       row.appendChild(button("Trust", "btn btn-tonal btn-small", function () { openTrust(device); }, "check"));
     }
@@ -257,6 +320,7 @@
     var text = el("span");
     if (item.expires_at) {
       text.setAttribute("data-expires", item.expires_at);
+      text.setAttribute("data-prefix", "");
       text.textContent = timeLeft(item.expires_at - Date.now() / 1000);
     } else {
       text.textContent = "No expiry";
@@ -277,7 +341,7 @@
     if (!shown.length) {
       list.appendChild(emptyState(data.devices.length
         ? "No devices match your search."
-        : (data.router_online ? "No devices are connected right now." : "Device list unavailable while the router is unreachable.")));
+        : (data.router_online ? "No devices are connected right now." : "Waiting for the router. Devices will appear here once it responds.")));
     }
     shown.forEach(function (device) { list.appendChild(deviceCard(device)); });
 
@@ -290,7 +354,6 @@
   }
 
   function render(data) {
-    state.data = data;
     renderStatus(data);
     var signature = signatureOf(data);
     var active = document.activeElement;
@@ -307,17 +370,103 @@
     for (var index = 0; index < nodes.length; index++) {
       var node = nodes[index];
       var left = Number(node.getAttribute("data-expires")) - now;
-      var prefix = node.textContent.indexOf("Trusted, ") === 0 ? "Trusted, " : "";
-      node.textContent = prefix + timeLeft(left);
+      node.textContent = (node.getAttribute("data-prefix") || "") + timeLeft(left);
+    }
+  }
+
+  /* ---------- Snapshot handling ---------- */
+  function acceptSnapshot(data) {
+    var previous = state.data;
+    if (previous && previous.devices.length > 0 && data.devices.length === 0 && (data.stale || !data.router_online)) {
+      data.devices = previous.devices;
+      data.metrics.connected = previous.metrics.connected;
+      data.metrics.throttled = previous.metrics.throttled;
+    }
+    state.data = data;
+    writeStore(CACHE_KEY, data);
+    render(data);
+  }
+
+  function load() {
+    return api("/api/data").then(function (data) {
+      acceptSnapshot(data);
+      return data;
+    });
+  }
+
+  function refreshNow() {
+    return load().catch(function () { /* the stream will catch up */ });
+  }
+
+  /* ---------- Live stream ---------- */
+  function startFallback() {
+    if (stream.fallbackTimer) { return; }
+    stream.fallbackTimer = setInterval(function () { load().catch(function () { setLive("retry"); }); }, 5000);
+  }
+
+  function stopFallback() {
+    if (stream.fallbackTimer) { clearInterval(stream.fallbackTimer); stream.fallbackTimer = null; }
+  }
+
+  function closeStream() {
+    if (stream.source) { stream.source.close(); stream.source = null; }
+    if (stream.reconnectTimer) { clearTimeout(stream.reconnectTimer); stream.reconnectTimer = null; }
+  }
+
+  function scheduleReconnect(delay) {
+    if (stream.reconnectTimer) { return; }
+    stream.reconnectTimer = setTimeout(function () {
+      stream.reconnectTimer = null;
+      connectStream();
+    }, delay);
+  }
+
+  function connectStream() {
+    closeStream();
+    if (!window.EventSource) {
+      setLive("retry");
+      startFallback();
+      return;
+    }
+    var source = new EventSource("/stream");
+    stream.source = source;
+    source.addEventListener("snapshot", function (event) {
+      var data;
+      try { data = JSON.parse(event.data); } catch (e) { return; }
+      stream.lastMessage = Date.now();
+      stopFallback();
+      setLive("live");
+      acceptSnapshot(data);
+    });
+    source.onerror = function () {
+      setLive("retry");
+      startFallback();
+      if (source.readyState === 2) {
+        scheduleReconnect(5000);
+      }
+    };
+  }
+
+  function watchdog() {
+    if (stream.source && stream.lastMessage && Date.now() - stream.lastMessage > STALL_MS) {
+      stream.lastMessage = 0;
+      setLive("retry");
+      startFallback();
+      connectStream();
     }
   }
 
   /* ---------- Actions ---------- */
-  function load() {
-    return api("/api/data").then(render).catch(function () {
-      $("routerPill").textContent = "App offline";
-      $("routerPill").className = "pill bad";
+  function setTab(name) {
+    state.tab = name;
+    Array.prototype.forEach.call(document.querySelectorAll(".tab"), function (tab) {
+      var active = tab.getAttribute("data-tab") === name;
+      tab.classList.toggle("is-active", active);
+      tab.setAttribute("aria-selected", active ? "true" : "false");
     });
+    $("panelConnected").hidden = name !== "connected";
+    $("panelTrusted").hidden = name !== "trusted";
+    saveUi();
   }
 
   function openTrust(device) {
@@ -337,10 +486,20 @@
         return api("/api/untrust-device", "POST", { mac: mac })
           .then(function (result) {
             toast(result.throttled_now ? name + " is now throttled." : name + " will be throttled when the router responds.");
-            return load();
+            return refreshNow();
           });
       }
     );
+  }
+
+  function settingsPayload() {
+    return {
+      sender: $("setSender").value,
+      target: $("setTarget").value,
+      app_password: $("setPassword").value,
+      router_ip: $("setRouterIp").value,
+      router_password: $("setRouterPassword").value
+    };
   }
 
   function bindEvents() {
@@ -357,6 +516,15 @@
       ["trustModal", "confirmModal", "settingsModal"].forEach(closeModal);
     });
 
+    document.addEventListener("visibilitychange", function () {
+      if (!document.hidden) {
+        refreshNow();
+        if (!stream.source || stream.source.readyState === 2) { connectStream(); }
+      }
+    });
+
+    window.addEventListener("online", function () { connectStream(); refreshNow(); });
+
     $("themeBtn").addEventListener("click", function () {
       var next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
       document.documentElement.setAttribute("data-theme", next);
@@ -364,21 +532,21 @@
       syncThemeIcon();
     });
 
-    Array.prototype.forEach.call(document.querySelectorAll(".tab"), function (tab) {
-      tab.addEventListener("click", function () {
-        state.tab = tab.getAttribute("data-tab");
-        Array.prototype.forEach.call(document.querySelectorAll(".tab"), function (other) {
-          var active = other === tab;
-          other.classList.toggle("is-active", active);
-          other.setAttribute("aria-selected", active ? "true" : "false");
-        });
-        $("panelConnected").hidden = state.tab !== "connected";
-        $("panelTrusted").hidden = state.tab !== "trusted";
+    $("logoutBtn").addEventListener("click", function () {
+      closeStream();
+      api("/logout", "POST").catch(function () { /* ignore */ }).then(function () {
+        try { localStorage.removeItem(CACHE_KEY); } catch (e) { /* ignore */ }
+        goToLogin();
       });
+    });
+
+    Array.prototype.forEach.call(document.querySelectorAll(".tab"), function (tab) {
+      tab.addEventListener("click", function () { setTab(tab.getAttribute("data-tab")); });
     });
 
     $("searchInput").addEventListener("input", function (event) {
       state.search = event.target.value.trim().toLowerCase();
+      saveUi();
       if (state.data) { state.signature = ""; render(state.data); }
     });
 
@@ -396,7 +564,7 @@
       var btn = $("refreshBtn");
       btn.disabled = true;
       api("/api/refresh", "POST")
-        .then(function (data) { render(data); toast("Device list refreshed."); })
+        .then(function (data) { acceptSnapshot(data); toast("Device list refreshed."); })
         .catch(fail)
         .then(function () { btn.disabled = false; });
     });
@@ -409,7 +577,7 @@
         function () {
           return api("/api/panic-lock", "POST").then(function (result) {
             toast(result.throttled + " device(s) throttled.");
-            return load();
+            return refreshNow();
           });
         }
       );
@@ -423,7 +591,7 @@
         function () {
           return api("/api/reboot", "POST").then(function () {
             toast("Reboot command sent. The router will be back shortly.");
-            return load();
+            return refreshNow();
           });
         }
       );
@@ -447,9 +615,10 @@
       api("/api/trust-device", "POST", { mac: device.mac, name: name, duration: duration })
         .then(function () {
           state.durations[device.mac] = duration;
+          saveUi();
           closeModal("trustModal");
           toast(name + " is now trusted.");
-          return load();
+          return refreshNow();
         })
         .catch(fail)
         .then(function () { btn.disabled = false; });
@@ -462,25 +631,17 @@
         $("setRouterIp").value = settings.router_ip;
         $("setPassword").value = "";
         $("setRouterPassword").value = "";
+        $("pwCurrent").value = "";
+        $("pwNew").value = "";
         $("setPassword").placeholder = settings.password_set ? "Saved. Leave blank to keep it" : "16-character app password";
-        $("setRouterPassword").placeholder = settings.router_password_set ? "Saved. Leave blank to keep it" : "Leave blank if none";
+        $("setRouterPassword").placeholder = settings.router_password_set ? "Saved. Leave blank to keep it" : "Enter the router admin password";
         openModal("settingsModal");
       }).catch(fail);
     });
 
-    function settingsPayload() {
-      return {
-        sender: $("setSender").value,
-        target: $("setTarget").value,
-        app_password: $("setPassword").value,
-        router_ip: $("setRouterIp").value,
-        router_password: $("setRouterPassword").value
-      };
-    }
-
     $("saveSettingsBtn").addEventListener("click", function () {
       api("/api/settings", "POST", settingsPayload())
-        .then(function () { closeModal("settingsModal"); toast("Settings saved."); return load(); })
+        .then(function () { closeModal("settingsModal"); toast("Settings saved."); })
         .catch(fail);
     });
 
@@ -493,6 +654,20 @@
         .catch(fail)
         .then(function () { btn.disabled = false; });
     });
+
+    $("changePwBtn").addEventListener("click", function () {
+      var btn = $("changePwBtn");
+      btn.disabled = true;
+      api("/api/change-password", "POST", { current: $("pwCurrent").value, "new": $("pwNew").value })
+        .then(function (result) {
+          if (result.csrf) { csrfToken = result.csrf; }
+          $("pwCurrent").value = "";
+          $("pwNew").value = "";
+          toast("Password changed. Other devices were signed out.");
+        })
+        .catch(fail)
+        .then(function () { btn.disabled = false; });
+    });
   }
 
   function syncThemeIcon() {
@@ -501,9 +676,28 @@
     $("themeBtn").setAttribute("aria-label", dark ? "Switch to light theme" : "Switch to dark theme");
   }
 
+  /* ---------- Startup ---------- */
+  function restore() {
+    var ui = readStore(UI_KEY);
+    if (ui) {
+      state.search = typeof ui.search === "string" ? ui.search : "";
+      state.durations = ui.durations && typeof ui.durations === "object" ? ui.durations : {};
+      $("searchInput").value = state.search;
+      setTab(ui.tab === "trusted" ? "trusted" : "connected");
+    }
+    var cached = readStore(CACHE_KEY);
+    if (cached && Array.isArray(cached.devices) && Array.isArray(cached.trusted) && cached.metrics) {
+      state.data = cached;
+      render(cached);
+      setLive("cached");
+    }
+  }
+
   syncThemeIcon();
   bindEvents();
-  load();
-  setInterval(load, POLL_MS);
+  restore();
+  connectStream();
+  load().catch(function () { /* the stream or fallback will retry */ });
   setInterval(tickCountdowns, 1000);
+  setInterval(watchdog, 5000);
 })();

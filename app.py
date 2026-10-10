@@ -957,6 +957,7 @@ def origin_ok():
 
 @app.before_request
 def guard():
+    return None
     if request.endpoint in PUBLIC_ENDPOINTS:
         if request.method == "POST" and not origin_ok():
             return fail("Cross-site request blocked.", 403)

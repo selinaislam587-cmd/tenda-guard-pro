@@ -169,6 +169,9 @@
         <span>Router admin password</span>
         <input type="password" id="setRouterPassword" autocomplete="new-password" placeholder="Leave blank to keep the saved password">
       </label>
+      <div class="dialog-actions">
+        <button class="btn btn-tonal" type="button" id="diagnoseBtn"><svg class="i"><use href="#i-router"/></svg>Test router connection</button>
+      </div>
       <h3 class="group-title"><svg class="i"><use href="#i-mail"/></svg>Email alerts</h3>
       <label class="field">
         <span>Sender Gmail address</span>
@@ -197,6 +200,20 @@
       </label>
       <div class="dialog-actions">
         <button class="btn btn-outline" type="button" id="changePwBtn">Change password</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="scrim" id="diagModal" hidden>
+    <div class="dialog dialog-wide" role="dialog" aria-modal="true" aria-labelledby="diagTitle">
+      <div class="dialog-head">
+        <h2 id="diagTitle">Router connection test</h2>
+        <button class="icon-btn" type="button" data-close="diagModal" aria-label="Close"><svg class="i"><use href="#i-close"/></svg></button>
+      </div>
+      <pre class="diag" id="diagOutput">Running test...</pre>
+      <div class="dialog-actions">
+        <button class="btn btn-text" type="button" id="diagCopy">Copy report</button>
+        <button class="btn btn-filled" type="button" data-close="diagModal">Close</button>
       </div>
     </div>
   </div>

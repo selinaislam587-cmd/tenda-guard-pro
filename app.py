@@ -308,19 +308,20 @@ class RouterClient:
     def fetch_devices(self):
         items = self.endpoints()
         last = None
+        headers = {"X-Requested-With": "XMLHttpRequest"}
         for path in items:
-            # ১. প্রথমে GET রিকোয়েস্ট ট্রাই করি
+            # ১. প্রথমে হেডারসহ GET রিকোয়েস্ট ট্রাই করি
             try:
-                resp = self.raw("GET", path, params={"random": "%.6f" % time.time()})
+                resp = self.raw("GET", path, headers=headers, params={"random": "%.6f" % time.time()})
                 if resp.status_code == 200 and not looks_like_login(resp):
                     return path, resp
                 last = resp
             except Exception:
                 pass
 
-            # ২. GET কাজ না করলে POST রিকোয়েস্ট ট্রাই করি
+            # ২. GET কাজ না করলে হেডার ও ডেটাসহ POST রিকোয়েস্ট ট্রাই করি
             try:
-                resp = self.raw("POST", path, data={})
+                resp = self.raw("POST", path, headers=headers, data={"action": "get"})
                 if resp.status_code == 200 and not looks_like_login(resp):
                     return path, resp
                 last = resp
@@ -328,6 +329,7 @@ class RouterClient:
                 pass
 
         return None, last
+
 
 
     def session_valid(self):

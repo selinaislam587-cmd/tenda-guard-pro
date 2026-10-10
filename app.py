@@ -14,6 +14,7 @@
 # Run:  pip install flask requests && python app.py
 # =============================================================================
 
+import base64
 import hashlib
 import hmac
 import json
@@ -58,8 +59,9 @@ DEFAULT_CONFIG = {
         "ip": "192.168.0.1",
         "username": "admin",
         "password": "",
-        "devices_endpoint": "/goform/getOnlineDeviceList",
-        "fallback_endpoints": ["/goform/GetOnlineDevice", "/goform/getNetDeviceList"],
+        "devices_endpoint": "/goform/getQos",
+        "fallback_endpoints": ["/goform/getOnlineList", "/goform/getNetDeviceList"],
+        "limit_endpoint": "/goform/setQos",
         "limit_param": "list",
         "limit_template": "{name}\t{mac}\t{up}\t{down}\t{ip}",
     },
@@ -153,10 +155,19 @@ MAC_RE = re.compile(r"(?:[0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}")
 IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 MAC_KEYS = ["qosListMac", "mac", "devMac", "macAddr", "macAddress", "MAC", "hwaddr"]
 IP_KEYS = ["qosListIP", "ip", "devIp", "devIP", "ipAddr", "ipAddress", "IP"]
+UP_LIMIT_KEYS = ["qosListUpLimit", "upLimit"]
+DOWN_LIMIT_KEYS = ["qosListDownLimit", "downLimit"]
 NAME_KEYS = ["qosListRemark", "qosListHostname", "hostName", "hostname", "devName",
              "deviceName", "name", "devHostName", "remark"]
 HOST_RE = re.compile(r"^[A-Za-z0-9.\-]{1,253}(:\d{1,5})?$")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def to_int(value):
+    try:
+        return int(float(str(value)))
+    except (TypeError, ValueError):
+        return None
 
 
 def normalize_mac(value):
@@ -207,6 +218,8 @@ def parse_devices(text):
                 "mac": mac,
                 "ip": pick(item, IP_KEYS),
                 "name": pick(item, NAME_KEYS)[:60] or "Unknown device",
+                "up_limit": to_int(pick(item, UP_LIMIT_KEYS)),
+                "down_limit": to_int(pick(item, DOWN_LIMIT_KEYS)),
             })
         return devices
 
@@ -266,7 +279,34 @@ def looks_like_login(resp):
     return False
 
 
+BUILTIN_ENDPOINTS = [
+    ("/goform/getQos", {"modules": "onlineList"}),
+    ("/goform/getOnlineList", {}),
+    ("/goform/getNetDeviceList", {}),
+]
+AUTH_COOKIE = "ecos_pw"
+PASSWORD_KINDS = ("base64", "md5", "plain")
+
+
+def encode_password(kind, password):
+    if kind == "base64":
+        return base64.b64encode(password.encode("utf-8")).decode("ascii")
+    if kind == "md5":
+        return hashlib.md5(password.encode("utf-8")).hexdigest()
+    return password
+
+
 class RouterClient:
+    """Talks to the Tenda F3 web server (ecos firmware family).
+
+    Verified facts (from public research on this firmware family):
+      * login endpoint is POST /login/Auth
+      * the session cookie is named ecos_pw
+      * device data comes from /goform/getQos with modules=onlineList
+      * the password is Base64 on many F3 revisions and MD5 on others, so all
+        encodings are tried and the one that works is remembered.
+    """
+
     def __init__(self):
         self.lock = threading.RLock()
         self.reset()
@@ -277,10 +317,13 @@ class RouterClient:
             self.session.headers.update({"User-Agent": "Mozilla/5.0 (TendaGuardPro)", "Accept": "*/*"})
             self.winner = None
             self.endpoint = None
-            self.last_login = {}
+            self.inline_pw = None
             self.fail_count = 0
             self.backoff_until = 0
+            self.last_login = {}
+            self.last_fetch = []
 
+    # ---- basics ----
     def host(self):
         return cfg["router"]["ip"]
 
@@ -295,51 +338,79 @@ class RouterClient:
             method, self.base_url() + path, timeout=(4, 8), allow_redirects=False, **kwargs
         )
 
-    def endpoints(self):
-        items = [cfg["router"].get("devices_endpoint") or "/goform/getOnlineList"]
-        for extra in cfg["router"].get("fallback_endpoints", []):
-            if extra not in items:
-                items.append(extra)
-        if self.endpoint in items:
-            items.remove(self.endpoint)
-            items.insert(0, self.endpoint)
-        return items
+    # ---- device list ----
+    def endpoint_specs(self):
+        specs = list(BUILTIN_ENDPOINTS)
+        known = [path for path, _ in specs]
+        extra = [cfg["router"].get("devices_endpoint", "")] + list(cfg["router"].get("fallback_endpoints", []))
+        for path in extra:
+            if path and path not in known:
+                specs.append((path, {}))
+                known.append(path)
+        if self.endpoint:
+            specs.sort(key=lambda spec: 0 if spec[0] == self.endpoint else 1)
+        return specs
 
     def fetch_devices(self):
-        items = self.endpoints()
-        last = None
-        headers = {"X-Requested-With": "XMLHttpRequest"}
-        for path in items:
-            # ১. প্রথমে হেডারসহ GET রিকোয়েস্ট ট্রাই করি
-            try:
-                resp = self.raw("GET", path, headers=headers, params={"random": "%.6f" % time.time()})
-                if resp.status_code == 200 and not looks_like_login(resp):
-                    return path, resp
-                last = resp
-            except Exception:
-                pass
-
-            # ২. GET কাজ না করলে হেডার ও ডেটাসহ POST রিকোয়েস্ট ট্রাই করি
-            try:
-                resp = self.raw("POST", path, headers=headers, data={"action": "get"})
-                if resp.status_code == 200 and not looks_like_login(resp):
-                    return path, resp
-                last = resp
-            except Exception:
-                pass
-
-        return None, last
-
-
+        """Tries every known device-list page. Returns (path, response) of the first
+        usable one, otherwise the last response seen."""
+        last = (None, None)
+        login_hit = None
+        trail = []
+        for path, params in self.endpoint_specs():
+            query = dict(params)
+            query["random"] = "%.6f" % time.time()
+            if self.inline_pw:
+                data = dict(params)
+                data["password"] = self.inline_pw
+                resp = self.raw("POST", path, params={"random": query["random"]}, data=data)
+            else:
+                resp = self.raw("GET", path, params=query)
+            login_like = looks_like_login(resp)
+            trail.append((path, resp.status_code, login_like))
+            last = (path, resp)
+            if login_like and login_hit is None:
+                login_hit = (path, resp)
+            if resp.status_code == 404 or login_like:
+                continue
+            self.last_fetch = trail
+            return path, resp
+        self.last_fetch = trail
+        return login_hit or last
 
     def session_valid(self):
         path, resp = self.fetch_devices()
         return resp is not None and resp.status_code == 200 and not looks_like_login(resp)
 
+    def get_devices(self):
+        with self.lock:
+            path, resp = self.fetch_devices()
+            if looks_like_login(resp):
+                self.login()
+                path, resp = self.fetch_devices()
+                if looks_like_login(resp):
+                    raise RouterAuthError("The router still shows its login page after signing in.")
+            if resp is None or resp.status_code == 404:
+                raise RouterFormatError(
+                    "The router has none of the known device-list pages (HTTP 404). "
+                    "Use Settings > Test router connection.")
+            resp.raise_for_status()
+            self.endpoint = path
+            devices = parse_devices(resp.text)
+            body_text = (resp.text or "").strip()
+            if not devices and body_text and body_text not in ("[]", "{}") and not MAC_RE.search(body_text):
+                try:
+                    json.loads(body_text)
+                except ValueError:
+                    raise RouterFormatError(
+                        "Unexpected reply from the router: {}".format(" ".join(body_text[:80].split())))
+            return devices
+
+    # ---- login ----
     def discover_login(self):
-        """Reads the router's own login page to learn the form, field names and script URLs."""
-        info = {"page_status": None, "actions": [], "user_field": "", "pass_field": "",
-                "hidden": {}, "js_urls": [], "uses_md5": True, "scripts_read": 0}
+        """Reads the router's own login page to learn field names, form targets and hints."""
+        info = {"page_status": None, "actions": [], "user_field": "", "pass_field": "", "hidden": {},
+                "js_urls": [], "hints": [], "kinds": list(PASSWORD_KINDS), "scripts_read": 0}
         try:
             page = self.raw("GET", "/login.html")
         except requests.RequestException:
@@ -348,8 +419,7 @@ class RouterClient:
         html = page.text or ""
         if page.status_code != 200 or not html:
             return info
-        forms = re.findall(r"<form[^>]*>", html, re.I)
-        for tag in forms:
+        for tag in re.findall(r"<form[^>]*>", html, re.I):
             match = re.search(r"action\s*=\s*[\"']([^\"']*)", tag, re.I)
             if match and match.group(1) and not match.group(1).startswith("#"):
                 info["actions"].append(match.group(1) if match.group(1).startswith("/") else "/" + match.group(1))
@@ -367,7 +437,7 @@ class RouterClient:
             elif kind == "hidden":
                 info["hidden"][name.group(1)] = value.group(1) if value else ""
         blob = html
-        for src_url in re.findall(r"<script[^>]+src\s*=\s*[\"']([^\"']+)", html, re.I)[:4]:
+        for src_url in re.findall(r"<script[^>]+src\s*=\s*[\"']([^\"']+)", html, re.I)[:5]:
             if src_url.startswith("http"):
                 continue
             path = src_url if src_url.startswith("/") else "/" + src_url
@@ -376,50 +446,68 @@ class RouterClient:
             except requests.RequestException:
                 continue
             if script.status_code == 200:
-                blob += "\n" + script.text[:200000]
+                blob += "\n" + script.text[:300000]
                 info["scripts_read"] += 1
         for url in re.findall(r"[\"'](/[A-Za-z0-9_./\-]*(?:login|Login|auth|Auth)[A-Za-z0-9_./\-]*)[\"']", blob):
             if url not in info["js_urls"] and not url.endswith((".html", ".js", ".css")):
                 info["js_urls"].append(url)
-        info["uses_md5"] = bool(re.search(r"md5", blob, re.I)) or not blob.strip()
+        for line in blob.splitlines():
+            if re.search(r"ecos_pw|base64|md5|btoa|login/Auth", line, re.I) and len(info["hints"]) < 8:
+                cleaned = " ".join(line.split())[:180]
+                if cleaned and cleaned not in info["hints"]:
+                    info["hints"].append(cleaned)
+        has_b64 = bool(re.search(r"base64|btoa", blob, re.I))
+        has_md5 = bool(re.search(r"md5", blob, re.I))
+        if has_md5 and not has_b64:
+            info["kinds"] = ["md5", "base64", "plain"]
         return info
 
-    def login_candidates(self, user, password, digest, disc):
-        kinds = [("md5", digest), ("plain", password)] if disc["uses_md5"] else [("plain", password), ("md5", digest)]
+    def login_candidates(self, user, password, disc):
+        kinds = disc["kinds"]
         paths = []
-        for path in disc["actions"] + disc["js_urls"] + ["/login/Auth", "/login.cgi", "/goform/login"]:
+        for path in disc["actions"] + ["/login/Auth"] + disc["js_urls"]:
             if path and path not in paths:
                 paths.append(path)
-        paths = paths[:5]
+        paths = paths[:3]
         fieldsets = []
         if disc["user_field"] or disc["pass_field"]:
             fieldsets.append((disc["user_field"] or "username", disc["pass_field"] or "password"))
-        for pair in [("username", "password"), ("user", "pass"), ("user", "password"), ("login_user", "login_pwd")]:
+        for pair in [("username", "password"), ("user", "pass")]:
             if pair not in fieldsets:
                 fieldsets.append(pair)
-        fieldsets = fieldsets[:3]
+        fieldsets = fieldsets[:2]
 
-        def data_for(user_key, pass_key, value):
+        def post_data(user_key, pass_key, kind):
             data = dict(disc["hidden"])
             data[user_key] = user
-            data[pass_key] = value
+            data[pass_key] = encode_password(kind, password)
             return data
 
-        candidates = [{"label": "session cookie only (md5)", "cookie": True, "path": None, "data": {}}]
-        for index, path in enumerate(paths):
+        first_path = paths[0]
+        first_user, first_pass = fieldsets[0]
+        candidates = []
+        for kind in kinds:
+            candidates.append({"label": "POST {} {}/{} password={}".format(first_path, first_user, first_pass, kind),
+                               "cookie": None, "post": (first_path, post_data(first_user, first_pass, kind)), "inline": None})
+        for kind in kinds:
+            candidates.append({"label": "cookie {}={} + POST {}".format(AUTH_COOKIE, kind, first_path),
+                               "cookie": (AUTH_COOKIE, encode_password(kind, password)),
+                               "post": (first_path, post_data(first_user, first_pass, kind)), "inline": None})
+        for kind in kinds:
+            candidates.append({"label": "cookie {}={} only".format(AUTH_COOKIE, kind),
+                               "cookie": (AUTH_COOKIE, encode_password(kind, password)), "post": None, "inline": None})
+        for kind in kinds:
+            candidates.append({"label": "password sent with each request ({})".format(kind),
+                               "cookie": None, "post": None, "inline": encode_password(kind, password)})
+        for path in paths:
             for user_key, pass_key in fieldsets:
-                for kind, value in kinds:
-                    candidates.append({
-                        "label": "POST {} fields {}/{} value {}".format(path, user_key, pass_key, kind),
-                        "cookie": False, "path": path, "data": data_for(user_key, pass_key, value),
-                    })
-            if index == 0:
-                user_key, pass_key = fieldsets[0]
-                candidates.append({
-                    "label": "cookie + POST {} fields {}/{} value md5".format(path, user_key, pass_key),
-                    "cookie": True, "path": path, "data": data_for(user_key, pass_key, digest),
-                })
-        return candidates[:32]
+                for kind in kinds:
+                    label = "POST {} {}/{} password={}".format(path, user_key, pass_key, kind)
+                    if any(c["label"] == label for c in candidates):
+                        continue
+                    candidates.append({"label": label, "cookie": None,
+                                       "post": (path, post_data(user_key, pass_key, kind)), "inline": None})
+        return candidates[:30]
 
     def login(self):
         if time.time() < self.backoff_until:
@@ -427,11 +515,10 @@ class RouterClient:
         password = self.password()
         if not password:
             raise RouterAuthError("The router asked for a login but no admin password is saved. Add it in Settings.")
-        user = cfg["router"].get("username", "admin")
-        digest = hashlib.md5(password.encode("utf-8")).hexdigest()
+        user = cfg["router"].get("username", "admin") or "admin"
         domain = self.host().split(":")[0]
         discovery = self.discover_login()
-        candidates = self.login_candidates(user, password, digest, discovery)
+        candidates = self.login_candidates(user, password, discovery)
         if self.winner:
             candidates = [self.winner] + [c for c in candidates if c["label"] != self.winner["label"]]
 
@@ -439,18 +526,19 @@ class RouterClient:
         errors = 0
         for candidate in candidates:
             self.session.cookies.clear()
+            self.inline_pw = candidate["inline"]
             if candidate["cookie"]:
-                self.session.cookies.set("password", digest, domain=domain, path="/")
+                self.session.cookies.set(candidate["cookie"][0], candidate["cookie"][1], domain=domain, path="/")
             outcome = ""
+            valid = False
             try:
-                if candidate["path"]:
-                    reply = self.raw("POST", candidate["path"], data=candidate["data"])
+                if candidate["post"]:
+                    reply = self.raw("POST", candidate["post"][0], data=candidate["post"][1])
                     outcome = "POST {}".format(reply.status_code)
                 valid = self.session_valid()
                 outcome += (" , " if outcome else "") + ("list OK" if valid else "still login page")
             except requests.RequestException as exc:
                 errors += 1
-                valid = False
                 outcome = "network error {}".format(exc.__class__.__name__)
             attempts.append({"label": candidate["label"], "result": outcome})
             if valid:
@@ -458,78 +546,22 @@ class RouterClient:
                 self.fail_count = 0
                 self.last_login = {"discovery": discovery, "attempts": attempts, "ok": True}
                 return True
+            self.inline_pw = None
 
         self.session.cookies.clear()
         self.last_login = {"discovery": discovery, "attempts": attempts, "ok": False}
-        if errors == len(attempts):
+        if attempts and errors == len(attempts):
             raise requests.ConnectionError("every login attempt failed to connect")
         self.fail_count += 1
         if self.fail_count >= 3:
             self.backoff_until = time.time() + min(600, 60 * self.fail_count)
         raise RouterAuthError("Router login failed. Use Settings > Test router connection to see why.")
 
-    def diagnose(self):
-        """Human readable report of what the router does. Never includes passwords."""
-        lines = []
-        with self.lock:
-            lines.append("Router: {}".format(self.host()))
-            lines.append("Admin password saved: {}".format("yes" if self.password() else "NO"))
-            try:
-                path, resp = self.fetch_devices()
-            except requests.RequestException as exc:
-                return ["Router: {}".format(self.host()), "Cannot connect: {}".format(exc.__class__.__name__),
-                        "Check the router address and that this phone is on the router's Wi-Fi."]
-            snippet = " ".join((resp.text or "")[:160].split()) if resp is not None else ""
-            lines.append("Device list request: {} -> HTTP {}".format(path, resp.status_code if resp is not None else "none"))
-            if resp is not None and resp.headers.get("Location"):
-                lines.append("Redirect to: {}".format(resp.headers["Location"]))
-            lines.append("Reply starts with: {}".format(snippet or "(empty)"))
-            needs_login = looks_like_login(resp)
-            lines.append("Detected as login page: {}".format("yes" if needs_login else "no"))
-            if needs_login:
-                try:
-                    self.login()
-                except (RouterAuthError, requests.RequestException) as exc:
-                    lines.append("Login result: FAILED ({})".format(str(exc)[:120]))
-                else:
-                    lines.append("Login result: OK using: {}".format(self.winner["label"]))
-                report = self.last_login
-                disc = report.get("discovery", {})
-                lines.append("Router login page: HTTP {} , form actions {} , user field {} , password field {} , scripts read {} , uses md5 {}".format(
-                    disc.get("page_status"), disc.get("actions") or "none", disc.get("user_field") or "?",
-                    disc.get("pass_field") or "?", disc.get("scripts_read"), disc.get("uses_md5")))
-                if disc.get("js_urls"):
-                    lines.append("Login URLs seen in its scripts: {}".format(", ".join(disc["js_urls"][:6])))
-                for item in report.get("attempts", [])[:12]:
-                    lines.append("  tried: {} -> {}".format(item["label"], item["result"]))
-            try:
-                devices = self.get_devices()
-                lines.append("Devices found now: {}".format(len(devices)))
-            except (RouterAuthError, RouterFormatError, requests.RequestException) as exc:
-                lines.append("Device list still failing: {}".format(str(exc)[:140]))
-        return lines
-
-    def get_devices(self):
-        with self.lock:
-            path, resp = self.fetch_devices()
-            if looks_like_login(resp):
-                self.login()
-                path, resp = self.fetch_devices()
-                if looks_like_login(resp):
-                    raise RouterAuthError("The router still shows its login page after signing in.")
-            resp.raise_for_status()
-            self.endpoint = path
-            devices = parse_devices(resp.text)
-            body_text = (resp.text or "").strip()
-            if not devices and body_text and body_text not in ("[]", "{}") and not MAC_RE.search(body_text):
-                try:
-                    json.loads(body_text)
-                except ValueError:
-                    raise RouterFormatError("Unexpected reply from the router: {}".format(" ".join(body_text[:80].split())))
-            return devices
-
+    # ---- actions ----
     def call(self, method, path, **kwargs):
         with self.lock:
+            if self.inline_pw and method == "POST" and isinstance(kwargs.get("data"), dict):
+                kwargs["data"] = dict(kwargs["data"], password=self.inline_pw)
             resp = self.raw(method, path, **kwargs)
             if looks_like_login(resp):
                 self.login()
@@ -538,22 +570,36 @@ class RouterClient:
                     raise RouterAuthError("The router rejected the request after signing in.")
             return resp
 
+    def limit_matches(self, mac, kbps):
+        """Reads the router back. True when it agrees (or does not report limits)."""
+        try:
+            devices = self.get_devices()
+        except (RouterAuthError, RouterFormatError, requests.RequestException):
+            return True
+        for device in devices:
+            if device["mac"] != mac:
+                continue
+            reported = [v for v in (device.get("up_limit"), device.get("down_limit")) if v is not None]
+            if not reported:
+                return True
+            return any(v > 0 for v in reported) == (kbps > 0)
+        return True
+
     def set_limit(self, device, kbps):
         template = cfg["router"].get("limit_template", DEFAULT_CONFIG["router"]["limit_template"])
         try:
             line = template.format(
-                name=device.get("name", "device"),
-                mac=device["mac"],
-                ip=device.get("ip", ""),
-                up=kbps,
-                down=kbps,
-            )
+                name=device.get("name", "device"), mac=device["mac"], ip=device.get("ip", ""), up=kbps, down=kbps)
         except (KeyError, IndexError, ValueError):
             return False
         payload = {cfg["router"].get("limit_param", "list"): line}
+        endpoint = cfg["router"].get("limit_endpoint") or "/goform/setQos"
         try:
-            resp = self.call("POST", "/goform/SetOnlineDevList", data=payload)
-            return resp.ok
+            resp = self.call("POST", endpoint, data=payload)
+            if not resp.ok:
+                return False
+            time.sleep(0.6)
+            return self.limit_matches(device["mac"], kbps)
         except (requests.RequestException, RouterAuthError):
             return False
 
@@ -565,6 +611,47 @@ class RouterClient:
             return True
         except (requests.RequestException, RouterAuthError):
             return False
+
+    # ---- diagnostics ----
+    def diagnose(self):
+        """Human readable report of what the router does. Never includes passwords or cookie values."""
+        lines = []
+        with self.lock:
+            lines.append("Router: {}".format(self.host()))
+            lines.append("Admin password saved: {}".format("yes" if self.password() else "NO"))
+            try:
+                path, resp = self.fetch_devices()
+            except requests.RequestException as exc:
+                return lines + ["Cannot connect: {}".format(exc.__class__.__name__),
+                                "Check the router address and that this phone is on the router's Wi-Fi."]
+            for trail_path, status, login_like in self.last_fetch:
+                lines.append("Try {} -> HTTP {}{}".format(trail_path, status, " (login page)" if login_like else ""))
+            snippet = " ".join((resp.text or "")[:140].split()) if resp is not None else ""
+            lines.append("Last reply starts with: {}".format(snippet or "(empty)"))
+            if resp is not None and looks_like_login(resp):
+                try:
+                    self.login()
+                except (RouterAuthError, requests.RequestException) as exc:
+                    lines.append("Login result: FAILED ({})".format(str(exc)[:120]))
+                else:
+                    lines.append("Login result: OK using: {}".format(self.winner["label"]))
+                report = self.last_login
+                disc = report.get("discovery", {})
+                lines.append("Router login page: HTTP {} , form actions {} , user field {} , password field {} , scripts read {}".format(
+                    disc.get("page_status"), disc.get("actions") or "none", disc.get("user_field") or "?",
+                    disc.get("pass_field") or "?", disc.get("scripts_read")))
+                for hint in disc.get("hints", [])[:8]:
+                    lines.append("  login script: {}".format(hint))
+                for item in report.get("attempts", [])[:14]:
+                    lines.append("  tried: {} -> {}".format(item["label"], item["result"]))
+            names = sorted({cookie.name for cookie in self.session.cookies})
+            lines.append("Cookies held: {}".format(", ".join(names) or "none"))
+            try:
+                devices = self.get_devices()
+                lines.append("Devices found now: {}".format(len(devices)))
+            except (RouterAuthError, RouterFormatError, requests.RequestException) as exc:
+                lines.append("Device list still failing: {}".format(str(exc)[:160]))
+        return lines
 
 
 router = RouterClient()

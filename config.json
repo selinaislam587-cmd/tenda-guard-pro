@@ -1,14 +1,27 @@
 {
   "auto_throttle": false,
-  "poll_interval": 10,
+  "poll_interval": 5,
+  "stream_interval": 4,
+  "device_grace_seconds": 45,
+  "empty_confirmations": 3,
   "server": {
     "host": "127.0.0.1",
     "port": 5000
+  },
+  "web": {
+    "password_hash": "scrypt:32768:8:1$yc4XcFJ2OOqnqwB8$8eb5e88177278dbddbc46f482f1a109a6a660b0875a757c6754f55b16a9b219ce6b578935726164b8c501ba54b14b37e74acf4c580b5321a9978954a5f3deab1",
+    "secret_key": "c68f07816b5cdcb39ae775868d05402c8fb1a2a8b1cb59276b64f047544e52da",
+    "session_hours": 72,
+    "trust_proxy": true
   },
   "router": {
     "ip": "192.168.0.1",
     "username": "admin",
     "password": "",
+    "devices_endpoint": "/goform/getOnlineList",
+    "fallback_endpoints": [
+      "/goform/getNetDeviceList"
+    ],
     "limit_param": "list",
     "limit_template": "{name}\t{mac}\t{up}\t{down}\t{ip}"
   },
@@ -20,5 +33,6 @@
   "trusted_devices": {},
   "limits": {},
   "pending_throttle": [],
-  "notified_macs": []
+  "notified_macs": [],
+  "known_devices": {}
 }

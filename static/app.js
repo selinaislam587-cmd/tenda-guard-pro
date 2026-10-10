@@ -513,7 +513,7 @@
 
     document.addEventListener("keydown", function (event) {
       if (event.key !== "Escape") { return; }
-      ["trustModal", "confirmModal", "settingsModal"].forEach(closeModal);
+      ["trustModal", "confirmModal", "settingsModal", "diagModal"].forEach(closeModal);
     });
 
     document.addEventListener("visibilitychange", function () {
@@ -653,6 +653,27 @@
         .then(function () { toast("Test email sent."); })
         .catch(fail)
         .then(function () { btn.disabled = false; });
+    });
+
+    $("diagnoseBtn").addEventListener("click", function () {
+      var btn = $("diagnoseBtn");
+      btn.disabled = true;
+      $("diagOutput").textContent = "Running test. This can take up to a minute...";
+      openModal("diagModal");
+      api("/api/settings", "POST", settingsPayload())
+        .then(function () { return api("/api/diagnose", "POST"); })
+        .then(function (result) { $("diagOutput").textContent = result.lines.join("\n"); })
+        .catch(function (error) { $("diagOutput").textContent = "Test failed: " + error.message; })
+        .then(function () { btn.disabled = false; });
+    });
+
+    $("diagCopy").addEventListener("click", function () {
+      var text = $("diagOutput").textContent;
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(function () { toast("Report copied."); }, function () { toast("Copy failed. Select the text manually.", true); });
+      } else {
+        toast("Select the text and copy it manually.", true);
+      }
     });
 
     $("changePwBtn").addEventListener("click", function () {

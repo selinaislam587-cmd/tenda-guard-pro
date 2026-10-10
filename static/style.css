@@ -563,3 +563,18 @@ select, .field input {
   .live #liveText { display: none; }
   .live { padding: 6px; }
 }
+
+.diag {
+  margin: 0;
+  padding: 12px;
+  max-height: 55vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  background: var(--surface-variant);
+  border-radius: var(--radius-s);
+  color: var(--on-surface);
+}

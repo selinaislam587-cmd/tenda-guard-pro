@@ -501,3 +501,65 @@ select, .field input {
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
 }
+
+/* =============================================================================
+   v2 additions: sprite, live badge, login page
+   ============================================================================= */
+.sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
+
+.appbar-actions { align-items: center; }
+
+.live {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 6px;
+  padding: 4px 10px;
+  border-radius: var(--radius-pill);
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--surface-variant);
+  color: var(--on-surface-variant);
+}
+.live-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.live[data-state="live"] { background: var(--ok-container); color: var(--ok); }
+.live[data-state="live"] .live-dot { animation: live-pulse 2s ease-in-out infinite; }
+.live[data-state="retry"] { background: var(--warn-container); color: var(--warn); }
+.live[data-state="cached"] { background: var(--warn-container); color: var(--warn); }
+
+@keyframes live-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.pill.warn { background: var(--warn-container); color: var(--warn); }
+
+.dialog { max-height: calc(100vh - 32px); overflow-y: auto; }
+
+.login-body { display: grid; place-items: center; min-height: 100vh; padding: 16px; }
+.login-card {
+  width: 100%;
+  max-width: 380px;
+  background: var(--surface-card);
+  border: 1px solid var(--outline);
+  border-radius: 28px;
+  padding: 28px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+.login-form { display: flex; flex-direction: column; gap: 14px; }
+.login-form .btn { height: 46px; }
+.form-error {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: var(--radius-s);
+  background: var(--danger-container);
+  color: var(--on-danger-container);
+  font-size: 14px;
+}
+
+@media (max-width: 420px) {
+  .live #liveText { display: none; }
+  .live { padding: 6px; }
+}

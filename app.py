@@ -62,6 +62,7 @@ DEFAULT_CONFIG = {
         "password": "",
         "devices_endpoint": "/goform/getQos",
         "fallback_endpoints": ["/goform/getOnlineList", "/goform/getNetDeviceList"],
+        "manual_cookie": "",
         "limit_endpoint": "/goform/setQos",
         "limit_param": "list",
         "limit_template": "{name}\t{mac}\t{up}\t{down}\t{ip}",
@@ -161,6 +162,7 @@ DOWN_LIMIT_KEYS = ["qosListDownLimit", "downLimit"]
 NAME_KEYS = ["qosListRemark", "qosListHostname", "hostName", "hostname", "devName",
              "deviceName", "name", "devHostName", "remark"]
 HOST_RE = re.compile(r"^[A-Za-z0-9.\-]{1,253}(:\d{1,5})?$")
+COOKIE_RE = re.compile(r"^[A-Za-z0-9_\-]{1,40}=[^\s;]{1,512}$")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
@@ -310,6 +312,7 @@ class RouterClient:
 
     def __init__(self):
         self.lock = threading.RLock()
+        self.abort_login = threading.Event()
         self.reset()
 
     def reset(self):
@@ -404,7 +407,7 @@ class RouterClient:
             specs.sort(key=lambda spec: 0 if spec[0] == self.endpoint else 1)
         return specs
 
-    def fetch_devices(self):
+    def fetch_devices(self, stop_on_login=False):
         """Tries every known device-list page. Returns (path, response) of the first
         usable one, otherwise the last response seen."""
         last = (None, None)
@@ -425,6 +428,8 @@ class RouterClient:
             if login_like and login_hit is None:
                 login_hit = (path, resp)
             if resp.status_code == 404 or login_like:
+                if login_like and stop_on_login:
+                    break
                 continue
             self.last_fetch = trail
             return path, resp
@@ -432,7 +437,7 @@ class RouterClient:
         return login_hit or last
 
     def session_valid(self):
-        path, resp = self.fetch_devices()
+        path, resp = self.fetch_devices(stop_on_login=True)
         return resp is not None and resp.status_code == 200 and not looks_like_login(resp)
 
     def get_devices(self):
@@ -576,6 +581,11 @@ class RouterClient:
                         continue
                     candidates.append({"label": label, "cookie": None,
                                        "post": (path, post_data(user_key, pass_key, kind)), "inline": None})
+        manual = (cfg["router"].get("manual_cookie") or "").strip()
+        if "=" in manual:
+            cookie_name, _, cookie_value = manual.partition("=")
+            candidates.insert(0, {"label": "manual session cookie ({})".format(cookie_name.strip()),
+                                  "cookie": (cookie_name.strip(), cookie_value.strip()), "post": None, "inline": None})
         return candidates[:36]
 
     def login(self):
@@ -595,6 +605,8 @@ class RouterClient:
         raw_replies = []
         errors = 0
         for candidate in candidates:
+            if self.abort_login.is_set():
+                raise RouterAuthError("Router login was interrupted.")
             self.session.cookies.clear()
             self.inline_pw = candidate["inline"]
             if candidate["cookie"]:
@@ -692,18 +704,21 @@ class RouterClient:
             return False
 
     # ---- diagnostics ----
-    def diagnose(self):
-        """Human readable report of what the router does. Never includes passwords or cookie values."""
-        lines = []
+    def diagnose(self, out=None):
+        """Human readable report of what the router does. Never includes passwords or cookie values.
+        Lines are appended to `out` as they are produced so a UI can show progress."""
+        lines = out if out is not None else []
         with self.lock:
+            self.abort_login.clear()
             self.backoff_until = 0
             lines.append("Router: {}".format(self.host()))
             lines.append("Admin password saved: {}".format("yes" if self.password() else "NO"))
             try:
                 path, resp = self.fetch_devices()
             except requests.RequestException as exc:
-                return lines + ["Cannot connect: {}".format(exc.__class__.__name__),
-                                "Check the router address and that this phone is on the router's Wi-Fi."]
+                lines.extend(["Cannot connect: {}".format(exc.__class__.__name__),
+                              "Check the router address and that this phone is on the router's Wi-Fi."])
+                return lines
             for trail_path, status, login_like in self.last_fetch:
                 lines.append("Try {} -> HTTP {}{}".format(trail_path, status, " (login page)" if login_like else ""))
             snippet = " ".join((resp.text or "")[:140].split()) if resp is not None else ""
@@ -950,6 +965,8 @@ def poll_once():
 
 
 def run_cycle(blocking=True):
+    if runtime.get("diagnosing"):
+        return False
     if not cycle_lock.acquire(blocking=blocking):
         return False
     try:
@@ -1395,6 +1412,7 @@ def api_settings_get():
             "password_set": bool(mail.get("app_password")),
             "router_ip": cfg["router"]["ip"],
             "router_password_set": bool(router.password()),
+            "router_cookie_set": bool(cfg["router"].get("manual_cookie")),
         })
 
 
@@ -1410,6 +1428,10 @@ def api_settings_post():
         return fail("Target email is not a valid address.")
     if router_ip and not HOST_RE.match(router_ip):
         return fail("Router address must look like 192.168.0.1.")
+    cookie_input = payload.get("router_cookie")
+    cookie_input = cookie_input.strip() if isinstance(cookie_input, str) else ""
+    if cookie_input and cookie_input != "-" and not COOKIE_RE.match(cookie_input):
+        return fail("Session cookie must look like name=value (no spaces or semicolons).")
     reset_router = False
     with cfg_lock:
         cfg["email"]["sender"] = sender
@@ -1420,6 +1442,9 @@ def api_settings_post():
         router_password = payload.get("router_password")
         if isinstance(router_password, str) and router_password.strip():
             cfg["router"]["password"] = router_password.strip()
+            reset_router = True
+        if cookie_input:
+            cfg["router"]["manual_cookie"] = "" if cookie_input == "-" else cookie_input
             reset_router = True
         if router_ip and router_ip != cfg["router"]["ip"]:
             cfg["router"]["ip"] = router_ip
@@ -1454,13 +1479,38 @@ def api_change_password():
     return jsonify({"ok": True, "csrf": session["csrf"]})
 
 
-@app.route("/api/diagnose", methods=["POST"])
-def api_diagnose():
+diag_state = {"running": False, "lines": [], "started": 0.0}
+
+
+def diag_job():
+    out = diag_state["lines"]
     try:
-        lines = router.diagnose()
-    except Exception as exc:  # report instead of crashing the request
-        lines = ["Diagnosis failed: {}".format(str(exc)[:160])]
-    return jsonify({"ok": True, "lines": lines})
+        router.diagnose(out=out)
+    except Exception as exc:  # report instead of dying silently
+        out.append("Diagnosis failed: {}".format(str(exc)[:160]))
+    finally:
+        runtime["diagnosing"] = False
+        diag_state["running"] = False
+        bus.publish()
+
+
+@app.route("/api/diagnose", methods=["GET"])
+def api_diagnose_status():
+    return jsonify({"ok": True, "running": diag_state["running"], "lines": list(diag_state["lines"])})
+
+
+@app.route("/api/diagnose", methods=["POST"])
+def api_diagnose_start():
+    with cfg_lock:
+        if diag_state["running"] and time.time() - diag_state["started"] < 300:
+            return jsonify({"ok": True, "running": True})
+        diag_state["running"] = True
+        diag_state["lines"] = ["Starting test..."]
+        diag_state["started"] = time.time()
+        runtime["diagnosing"] = True
+    router.abort_login.set()
+    threading.Thread(target=diag_job, name="router-diagnose", daemon=True).start()
+    return jsonify({"ok": True, "running": True})
 
 
 @app.route("/api/test-email", methods=["POST"])

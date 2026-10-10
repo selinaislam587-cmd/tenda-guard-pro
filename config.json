@@ -17,7 +17,7 @@
   "router": {
     "ip": "192.168.0.1",
     "username": "admin",
-    "password": "",
+    "password": "226435",
     "devices_endpoint": "/goform/getOnlineList",
     "fallback_endpoints": [
       "/goform/getNetDeviceList"
@@ -26,9 +26,9 @@
     "limit_template": "{name}\t{mac}\t{up}\t{down}\t{ip}"
   },
   "email": {
-    "sender": "",
-    "app_password": "",
-    "target": ""
+    "sender": "parsonal2264@gmail.com",
+    "app_password": "dokh hqcl obdg ytil",
+    "target": "parsonal2264@gmail.com"
   },
   "trusted_devices": {},
   "limits": {},

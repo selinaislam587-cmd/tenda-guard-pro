@@ -498,8 +498,28 @@
       target: $("setTarget").value,
       app_password: $("setPassword").value,
       router_ip: $("setRouterIp").value,
-      router_password: $("setRouterPassword").value
+      router_password: $("setRouterPassword").value,
+      router_cookie: $("setRouterCookie").value
     };
+  }
+
+  function pollDiagnose(startedAt) {
+    return new Promise(function (resolve) {
+      function tick() {
+        api("/api/diagnose").then(function (result) {
+          $("diagOutput").textContent = result.lines.join("\n") + (result.running ? "\n\nStill running. This can take a few minutes..." : "");
+          if (result.running && Date.now() - startedAt < 300000) {
+            setTimeout(tick, 1500);
+          } else {
+            resolve();
+          }
+        }).catch(function (error) {
+          $("diagOutput").textContent += "\n" + error.message;
+          resolve();
+        });
+      }
+      tick();
+    });
   }
 
   function bindEvents() {
@@ -631,6 +651,8 @@
         $("setRouterIp").value = settings.router_ip;
         $("setPassword").value = "";
         $("setRouterPassword").value = "";
+        $("setRouterCookie").value = "";
+        $("setRouterCookie").placeholder = settings.router_cookie_set ? "Saved. Leave blank to keep it, or type - to remove" : "ecos_pw=...";
         $("pwCurrent").value = "";
         $("pwNew").value = "";
         $("setPassword").placeholder = settings.password_set ? "Saved. Leave blank to keep it" : "16-character app password";
@@ -658,11 +680,11 @@
     $("diagnoseBtn").addEventListener("click", function () {
       var btn = $("diagnoseBtn");
       btn.disabled = true;
-      $("diagOutput").textContent = "Running test. This can take up to a minute...";
+      $("diagOutput").textContent = "Starting test...";
       openModal("diagModal");
       api("/api/settings", "POST", settingsPayload())
         .then(function () { return api("/api/diagnose", "POST"); })
-        .then(function (result) { $("diagOutput").textContent = result.lines.join("\n"); })
+        .then(function () { return pollDiagnose(Date.now()); })
         .catch(function (error) { $("diagOutput").textContent = "Test failed: " + error.message; })
         .then(function () { btn.disabled = false; });
     });
